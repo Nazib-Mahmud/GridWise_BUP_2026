@@ -70,7 +70,7 @@ Gemini example (PowerShell):
 ```powershell
 $env:LLM_PROVIDER="gemini"
 $env:GEMINI_API_KEY="YOUR_KEY"
-$env:GEMINI_MODEL="gemini-2.5-flash"
+$env:GEMINI_MODEL="gemini-3.5-flash-lite"
 ```
 
 OpenAI example (PowerShell):
@@ -125,6 +125,9 @@ First start the server with a real LLM key, then in another terminal run:
 
 ```bash
 python scripts/test_live_api_samples.py --base-url http://127.0.0.1:8000
+
+# If your provider free tier has a low request-per-minute quota:
+python scripts/test_live_api_samples.py --base-url http://127.0.0.1:8000 --delay 8
 ```
 
 This checks both the LLM semantics and optimal cost against the public pack. Public phrases/case IDs/reference schedules are **not** used by the production interpretation code.
@@ -198,7 +201,7 @@ Run with Gemini:
 docker run --rm -p 8000:8000 \
   -e LLM_PROVIDER=gemini \
   -e GEMINI_API_KEY="YOUR_KEY" \
-  -e GEMINI_MODEL="gemini-2.5-flash" \
+  -e GEMINI_MODEL="gemini-3.5-flash-lite" \
   gridwise-bup-2026:1.0
 ```
 

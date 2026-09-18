@@ -27,7 +27,7 @@ class Settings:
     provider: str = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
 
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "").strip()
-    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
     gemini_base_url: str = os.getenv(
         "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"
     ).rstrip("/")
@@ -36,7 +36,7 @@ class Settings:
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
     openai_base_url: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 
-    timeout_seconds: float = _float_env("LLM_TIMEOUT_SECONDS", 12.0)
+    timeout_seconds: float = _float_env("LLM_TIMEOUT_SECONDS", 20.0)
     max_attempts: int = max(1, min(_int_env("LLM_MAX_ATTEMPTS", 2), 3))
     cache_size: int = max(0, _int_env("LLM_CACHE_SIZE", 256))
 

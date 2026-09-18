@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections import OrderedDict
 from typing import Any
@@ -39,10 +40,89 @@ Rules:
 - A note must map to exactly one supported directive or no_op.
 - Do not alter base demand, solar, tariff, battery limits, or invent unsupported constraints.
 - Treat paraphrases by meaning, not keyword matching.
-
-Return JSON only with this top-level form:
-{"directive_interpretation":[{"note_index":0,"applies":true,"directive_type":"...","structured_adjustment":{},"explanation":"..."}]}
+- Keep explanation short and factual.
 """
+
+
+def _hours_schema() -> dict[str, Any]:
+    return {
+        "type": "array",
+        "items": {"type": "integer", "minimum": 0, "maximum": 23},
+        "minItems": 1,
+        "maxItems": 24,
+    }
+
+
+def _response_schema(note_count: int) -> dict[str, Any]:
+    # Gemini structured output constrains JSON shape; deterministic guardrails below
+    # still verify semantics and exact directive-specific values.
+    adjustment = {
+        "anyOf": [
+            {"type": "null"},
+            {
+                "type": "object",
+                "properties": {"hours": _hours_schema(), "factor": {"type": "number", "minimum": 0, "maximum": 1}},
+                "required": ["hours", "factor"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "hours": _hours_schema(),
+                    "minimum_energy_kwh": {"type": "number", "minimum": 0},
+                },
+                "required": ["hours", "minimum_energy_kwh"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {"hours": _hours_schema()},
+                "required": ["hours"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {"hours": _hours_schema(), "max_grid_kwh": {"type": "number", "minimum": 0}},
+                "required": ["hours", "max_grid_kwh"],
+                "additionalProperties": False,
+            },
+        ]
+    }
+    item = {
+        "type": "object",
+        "properties": {
+            "note_index": {"type": "integer", "minimum": 0, "maximum": max(0, note_count - 1)},
+            "applies": {"type": "boolean"},
+            "directive_type": {
+                "type": "string",
+                "enum": [
+                    "solar_reduction",
+                    "minimum_battery_reserve",
+                    "no_charge_window",
+                    "no_discharge_window",
+                    "max_grid_window",
+                    "no_op",
+                ],
+            },
+            "structured_adjustment": adjustment,
+            "explanation": {"type": "string"},
+        },
+        "required": ["note_index", "applies", "directive_type", "structured_adjustment", "explanation"],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "directive_interpretation": {
+                "type": "array",
+                "items": item,
+                "minItems": note_count,
+                "maxItems": note_count,
+            }
+        },
+        "required": ["directive_interpretation"],
+        "additionalProperties": False,
+    }
 
 
 class LLMInterpreter:
@@ -81,11 +161,7 @@ class LLMInterpreter:
         while len(self._cache) > settings.cache_size:
             self._cache.popitem(last=False)
 
-    async def interpret(
-        self,
-        notes: list[str],
-        battery: BatteryInput,
-    ) -> list[DirectiveInterpretation]:
+    async def interpret(self, notes: list[str], battery: BatteryInput) -> list[DirectiveInterpretation]:
         key = self._cache_key(notes, battery)
         cached = self._get_cached(key)
         if cached is not None:
@@ -95,9 +171,8 @@ class LLMInterpreter:
             "operator_notes": [{"note_index": i, "text": note} for i, note in enumerate(notes)],
             "battery": battery.model_dump(),
         }
-        user_prompt = (
-            "Interpret the following GridWise input according to the rules.\n"
-            + json.dumps(user_payload, ensure_ascii=False, separators=(",", ":"))
+        user_prompt = "Interpret this GridWise input. Return only the required structured JSON.\n" + json.dumps(
+            user_payload, ensure_ascii=False, separators=(",", ":")
         )
 
         last_error = "unknown LLM error"
@@ -105,62 +180,88 @@ class LLMInterpreter:
         for attempt in range(settings.max_attempts):
             prompt = user_prompt + correction
             try:
-                raw_text = await self._call_provider(prompt)
+                raw_text = await self._call_provider(prompt, len(notes))
                 parsed = self._parse_json(raw_text)
                 result = validate_and_normalize_interpretations(parsed, len(notes), battery)
                 self._put_cached(key, result)
                 return result
-            except (LLMServiceError, GuardrailError, json.JSONDecodeError) as exc:
-                last_error = str(exc)
+            except GuardrailError as exc:
+                last_error = f"guardrail: {exc}"
+                print(f"[GridWise][LLM] attempt={attempt + 1} {last_error}", flush=True)
                 correction = (
-                    "\nYour previous output failed deterministic validation. Regenerate the FULL JSON from scratch. "
-                    "Follow the exact field names, directive shapes, applies semantics, note_index order, and hour rules."
+                    "\nThe previous JSON failed validation. Regenerate the FULL JSON from scratch. "
+                    "Use the exact directive type, adjustment keys, applies semantics, note_index order, and whole-hour rules."
                 )
+            except (LLMServiceError, json.JSONDecodeError) as exc:
+                last_error = str(exc)
+                print(f"[GridWise][LLM] attempt={attempt + 1} provider_error={last_error}", flush=True)
+                # Small bounded backoff helps transient 429/5xx without threatening the 30s judge timeout.
+                if attempt + 1 < settings.max_attempts:
+                    await asyncio.sleep(min(1.5 * (attempt + 1), 3.0))
 
         raise LLMServiceError(f"LLM interpretation failed after validation: {last_error}")
 
-    async def _call_provider(self, user_prompt: str) -> str:
+    async def _call_provider(self, user_prompt: str, note_count: int) -> str:
         provider = settings.provider
         if provider == "gemini":
-            return await self._call_gemini(user_prompt)
+            return await self._call_gemini(user_prompt, note_count)
         if provider in {"openai", "openai_compatible"}:
             return await self._call_openai_compatible(user_prompt)
-        raise LLMServiceError(
-            "LLM_PROVIDER must be one of: gemini, openai, openai_compatible"
-        )
+        raise LLMServiceError("LLM_PROVIDER must be one of: gemini, openai, openai_compatible")
 
-    async def _call_gemini(self, user_prompt: str) -> str:
+    async def _call_gemini(self, user_prompt: str, note_count: int) -> str:
         if not settings.gemini_api_key:
             raise LLMServiceError("GEMINI_API_KEY is not configured")
 
-        model = quote(settings.gemini_model, safe="")
+        model_name = settings.gemini_model
+        model = quote(model_name, safe="")
         url = f"{settings.gemini_base_url}/models/{model}:generateContent"
+        generation_config: dict[str, Any] = {
+            "responseMimeType": "application/json",
+            "responseJsonSchema": _response_schema(note_count),
+            "maxOutputTokens": 1400,
+        }
+        # Gemini 3.x supports thinkingLevel; minimal is ideal for this constrained extraction task.
+        if model_name.startswith("gemini-3"):
+            generation_config["thinkingConfig"] = {"thinkingLevel": "minimal"}
+        else:
+            # Keep older-model behavior deterministic without using Gemini-3-only fields.
+            generation_config["temperature"] = 0
+
         payload = {
             "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
             "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-            "generationConfig": {
-                "temperature": 0,
-                "responseMimeType": "application/json",
-            },
+            "generationConfig": generation_config,
         }
         try:
             async with httpx.AsyncClient(timeout=settings.timeout_seconds) as client:
                 response = await client.post(
                     url,
-                    params={"key": settings.gemini_api_key},
+                    headers={"x-goog-api-key": settings.gemini_api_key, "Content-Type": "application/json"},
                     json=payload,
                 )
             if response.status_code >= 400:
-                raise LLMServiceError(f"Gemini provider returned HTTP {response.status_code}")
+                status = ""
+                try:
+                    body = response.json()
+                    status = str(body.get("error", {}).get("status", ""))
+                except Exception:
+                    pass
+                suffix = f" ({status})" if status else ""
+                raise LLMServiceError(f"Gemini provider returned HTTP {response.status_code}{suffix}")
             data = response.json()
             candidates = data.get("candidates") or []
             if not candidates:
-                raise LLMServiceError("Gemini returned no candidate")
+                block = data.get("promptFeedback", {}).get("blockReason", "")
+                raise LLMServiceError(f"Gemini returned no candidate{f' ({block})' if block else ''}")
             parts = candidates[0].get("content", {}).get("parts", [])
             text = "".join(str(p.get("text", "")) for p in parts).strip()
             if not text:
-                raise LLMServiceError("Gemini returned an empty response")
+                finish = candidates[0].get("finishReason", "")
+                raise LLMServiceError(f"Gemini returned an empty response{f' ({finish})' if finish else ''}")
             return text
+        except httpx.TimeoutException as exc:
+            raise LLMServiceError("Gemini request timed out") from exc
         except httpx.HTTPError as exc:
             raise LLMServiceError("Gemini request failed") from exc
         except (ValueError, KeyError, TypeError) as exc:
@@ -181,10 +282,7 @@ class LLMInterpreter:
         }
         if settings.provider == "openai":
             payload["response_format"] = {"type": "json_object"}
-        headers = {
-            "Authorization": f"Bearer {settings.openai_api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"}
         try:
             async with httpx.AsyncClient(timeout=settings.timeout_seconds) as client:
                 response = await client.post(url, headers=headers, json=payload)
